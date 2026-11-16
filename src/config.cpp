@@ -124,7 +124,10 @@ void config_valid() {
         body->speaker_select = 0;
         printf("[Config] speaker_select is invalid\n");
     }
-    body->enable_wake = 1;
+    if (body->enable_wake > 1) {
+        body->enable_wake = 1;
+        printf("[Config] enable_wake defaulted to 1\n");
+    }
     if (body->trigger_reduce > 10) {
         body->trigger_reduce = 0;
         printf("[Config] trigger_reduce is invalid\n");
@@ -145,8 +148,14 @@ void config_valid() {
         body->packet_mode = 0;
         printf("[Config] packet_mode is invalid\n");
     }
-    body->disconnect_on_dock = 1;
-    body->sleep_on_dock = 1;
+    if (body->disconnect_on_dock > 1) {
+        body->disconnect_on_dock = 1;
+        printf("[Config] disconnect_on_dock defaulted to 1\n");
+    }
+    if (body->sleep_on_dock > 1) {
+        body->sleep_on_dock = 1;
+        printf("[Config] sleep_on_dock defaulted to 1\n");
+    }
     button_remap_valid();
     shortcut_valid();
 }
