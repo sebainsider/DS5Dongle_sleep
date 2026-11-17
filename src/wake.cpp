@@ -139,11 +139,11 @@ void wake_note_usb_reconnect(void) {
 // host to miss the disconnect pulse (leaving usb_reconfiguring stuck true
 // or keeping the wake-keyboard descriptor) and aborts the F15 wake keystrokes.
 bool wake_defer_usb_reconnect(void) {
+    if (!get_config().enable_wake) return false;
     const uint64_t now = time_us_64();
     critical_section_enter_blocking(&wake_cs);
-    const bool busy = get_config().enable_wake &&
-                      (state == WAKE_REQUESTED || state == WAKE_KEY_DOWN ||
-                       state == WAKE_KEY_UP_SENT);
+    const bool busy = state == WAKE_REQUESTED || state == WAKE_KEY_DOWN ||
+                      state == WAKE_KEY_UP_SENT;
     const bool settling = (resume_at_us != 0) && (now - resume_at_us < WAKE_RECONNECT_SETTLE_US);
     const bool defer = host_suspended || tud_suspended() || busy || settling;
     pending_usb_reconnect = defer;
@@ -319,13 +319,14 @@ void wake_task(void) {
         WAKE_DBG("suspend debounce elapsed -> bt_disconnect()");
     }
 
-    if (get_config().enable_wake) {
-        critical_section_enter_blocking(&wake_cs);
-        const wake_state_t s = state;
-        const uint64_t entered = state_entered_us;
-        critical_section_exit(&wake_cs);
+    if (!get_config().enable_wake) return;
 
-        switch (s) {
+    critical_section_enter_blocking(&wake_cs);
+    const wake_state_t s = state;
+    const uint64_t entered = state_entered_us;
+    critical_section_exit(&wake_cs);
+
+    switch (s) {
             case WAKE_IDLE:
             case WAKE_PENDING_PRESS:
             case WAKE_DONE:
@@ -458,7 +459,6 @@ void wake_task(void) {
                     break;
                 }
             }
-        }
     }
 
 #if !ENABLE_SERIAL
