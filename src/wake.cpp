@@ -27,6 +27,7 @@
 #define WAKE_SETTLE_US        150000   // 150 ms — let host finish USB re-init
 #define WAKE_RECONNECT_SETTLE_US 2000000 // 2 s — let Windows xHCI/PnP finish wake before re-enumerating
 #define WAKE_RECONNECT_RETRY_US  2000000 // 2 s — retry if host missed disconnect and tud_mount_cb never fired
+#define WAKE_RECONNECT_MAX_RETRIES 2     // cap stalled-remount retries so slow hubs cannot loop forever
 #define WAKE_KEY_HOLD_US       80000   // 80 ms keydown -> keyup gap
 #define WAKE_KEY_UP_SETTLE_US 200000   // 200 ms between attempts (or before DONE)
 #define WAKE_REQUEST_TIMEOUT_US 5000000
@@ -71,6 +72,7 @@ static volatile bool host_resumed_event = false;
 static volatile uint64_t resume_at_us = 0;
 static volatile bool pending_usb_reconnect = false;
 static volatile uint64_t reconnect_started_us = 0;
+static volatile uint8_t reconnect_retries = 0;
 static wake_state_t state = WAKE_IDLE;
 static uint64_t state_entered_us = 0;
 static uint8_t key_attempts = 0;
@@ -172,6 +174,7 @@ extern "C" void tud_suspend_cb(bool remote_wakeup_en) {
     suspend_at_us = time_us_64();
     host_suspended = true;
     host_resumed_event = false;
+    reconnect_retries = 0;
     
     // Everything below is the wake-UP path (press a key to wake the host) -- enable_wake only.
     if (!get_config().enable_wake) return;
@@ -235,6 +238,7 @@ extern "C" void tud_mount_cb(void) {
     resume_at_us = time_us_64();
     suspend_at_us = 0;
     reconnect_until_us = 0;   // reconnect finished re-enumerating; end the grace early
+    reconnect_retries = 0;
 
     // Remove the ghost controller on resume/re-enumeration; retain only the wake keyboard when enabled.
     // If USB keep-charging is enabled, the PC may show a ghost device after startup/resume.
@@ -291,6 +295,7 @@ void wake_on_bt_disconnect(void) {
     critical_section_enter_blocking(&wake_cs);
     state = WAKE_IDLE;
     pending_usb_reconnect = false;
+    reconnect_retries = 0;
     prev_b7 = 0x08; prev_b8 = 0x00; prev_b9 = 0x00;
     critical_section_exit(&wake_cs);
     button_shortcut_reset();
@@ -472,9 +477,13 @@ void wake_task(void) {
         const bool need_full_device = bt_is_connected() && usb_keyboard_only && !usb_reconfiguring;
         const bool mount_stalled = bt_is_connected() && usb_reconfiguring &&
                                    reconnect_started_us != 0 &&
+                                   reconnect_retries < WAKE_RECONNECT_MAX_RETRIES &&
                                    (now - reconnect_started_us >= WAKE_RECONNECT_RETRY_US);
         if (pending_usb_reconnect || need_full_device || mount_stalled) {
             pending_usb_reconnect = false;
+            if (mount_stalled) {
+                reconnect_retries++;
+            }
             if (bt_is_connected()) {
                 WAKE_DBG("executing usb_reconnect(false) (need_full=%d stalled=%d)",
                          (int)need_full_device, (int)mount_stalled);
