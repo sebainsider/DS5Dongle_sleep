@@ -25,6 +25,8 @@
 // the system can re-suspend within ~1 s. Bigger settles + a second F15 give
 // Windows multiple polling cycles to pick the keystroke up.
 #define WAKE_SETTLE_US        150000   // 150 ms — let host finish USB re-init
+#define WAKE_RECONNECT_SETTLE_US 2000000 // 2 s — let Windows xHCI/PnP finish wake before re-enumerating
+#define WAKE_RECONNECT_RETRY_US  2000000 // 2 s — retry if host missed disconnect and tud_mount_cb never fired
 #define WAKE_KEY_HOLD_US       80000   // 80 ms keydown -> keyup gap
 #define WAKE_KEY_UP_SETTLE_US 200000   // 200 ms between attempts (or before DONE)
 #define WAKE_REQUEST_TIMEOUT_US 5000000
@@ -68,6 +70,7 @@ static volatile bool host_suspended = false;
 static volatile bool host_resumed_event = false;
 static volatile uint64_t resume_at_us = 0;
 static volatile bool pending_usb_reconnect = false;
+static volatile uint64_t reconnect_started_us = 0;
 static wake_state_t state = WAKE_IDLE;
 static uint64_t state_entered_us = 0;
 static uint8_t key_attempts = 0;
@@ -124,14 +127,16 @@ void wake_init(void) {
 // Called right before a deliberate USB reconnect (FUNC_RECONNECT): arm a grace window so the
 // suspend the reconnect causes is ignored, and drop any already-pending disconnect.
 void wake_note_usb_reconnect(void) {
-    reconnect_until_us = time_us_64() + WAKE_RECONNECT_GRACE_US;
+    const uint64_t now = time_us_64();
+    reconnect_started_us = now;
+    reconnect_until_us = now + WAKE_RECONNECT_GRACE_US;
     suspend_at_us = 0;
 }
 
 // Defer usb_reconnect(false) when the controller finishes BT feature init (0x20)
 // while the USB bus is still suspended or the post-resume F15 wake sequence is in
 // flight. Tearing down the USB pull-up during S3/Modern Standby resume causes the
-// host to miss the 150 ms disconnect pulse (leaving usb_reconfiguring stuck true
+// host to miss the disconnect pulse (leaving usb_reconfiguring stuck true
 // or keeping the wake-keyboard descriptor) and aborts the F15 wake keystrokes.
 bool wake_defer_usb_reconnect(void) {
     const uint64_t now = time_us_64();
@@ -139,7 +144,7 @@ bool wake_defer_usb_reconnect(void) {
     const bool busy = get_config().enable_wake &&
                       (state == WAKE_REQUESTED || state == WAKE_KEY_DOWN ||
                        state == WAKE_KEY_UP_SENT);
-    const bool settling = (resume_at_us != 0) && (now - resume_at_us < WAKE_SETTLE_US);
+    const bool settling = (resume_at_us != 0) && (now - resume_at_us < WAKE_RECONNECT_SETTLE_US);
     const bool defer = host_suspended || tud_suspended() || busy || settling;
     pending_usb_reconnect = defer;
     critical_section_exit(&wake_cs);
@@ -457,16 +462,24 @@ void wake_task(void) {
     }
 
 #if !ENABLE_SERIAL
-    // Once the host has resumed and the wake keystroke sequence (if any) has
-    // finished, perform the deferred USB re-enumeration so the awake host sees
-    // the 150 ms disconnect and mounts the full DualSense composite device.
-    if (pending_usb_reconnect && !host_suspended && !tud_suspended() &&
-        !wake_keyboard_busy() &&
-        (resume_at_us == 0 || now - resume_at_us >= WAKE_SETTLE_US)) {
-        pending_usb_reconnect = false;
-        if (bt_is_connected()) {
-            WAKE_DBG("executing deferred usb_reconnect(false)");
-            usb_reconnect(false);
+    // Once the host has resumed, the wake keystroke sequence has finished, and
+    // Windows' USB/PnP stack has settled after resume, perform the deferred USB
+    // re-enumeration so the awake host sees the disconnect and mounts the full
+    // DualSense composite device. Also recover if the controller is connected over
+    // BT while USB is still stuck in keyboard-only mode or waiting for remount.
+    if (!host_suspended && !tud_suspended() && !wake_keyboard_busy() &&
+        (resume_at_us == 0 || now - resume_at_us >= WAKE_RECONNECT_SETTLE_US)) {
+        const bool need_full_device = bt_is_connected() && usb_keyboard_only && !usb_reconfiguring;
+        const bool mount_stalled = bt_is_connected() && usb_reconfiguring &&
+                                   reconnect_started_us != 0 &&
+                                   (now - reconnect_started_us >= WAKE_RECONNECT_RETRY_US);
+        if (pending_usb_reconnect || need_full_device || mount_stalled) {
+            pending_usb_reconnect = false;
+            if (bt_is_connected()) {
+                WAKE_DBG("executing usb_reconnect(false) (need_full=%d stalled=%d)",
+                         (int)need_full_device, (int)mount_stalled);
+                usb_reconnect(false);
+            }
         }
     }
 #endif
